@@ -1,0 +1,114 @@
+<#
+.SYNOPSIS
+
+Enables the SSL state for a webapp that uses custom hostnames. 
+
+.DESCRIPTION
+
+When provided a webapp name (the name of app which SSL is to be enabled), a prexisting keyvault name (where the SSL cert (.pfx) is stored) and a prexisting certificate name, the SSL state will become 'sniEnabled', and the SSL certificate will be bound to the webapp.
+
+.PARAMETER WebappName
+Specifies the name of the webapp resource for which SSL is to be enabled.
+Default SSL state will be: 'sniEnabled'
+
+.PARAMETER existingKeyvaultName
+Specifies the name of the pre-existing shared keyvault containing the .pfx certificate that will be bind to your webapp.
+
+.PARAMETER existingCertificateName
+Specifies the name of the pre-existing certificate in the specified keyvault that will be bound to the webapp.
+
+.INPUTS
+
+This function does not support any piped inputs
+
+.OUTPUTS
+
+Returns status of the request to the keyvault, the request for the secret provided, and the status of the binding to the hostname.
+
+
+.EXAMPLE
+PS>
+PS> 
+
+.LINK
+http://linktoWiki
+#>
+
+function Enable-SslStateOnWebapp {
+    [CmdletBinding()]
+    param (
+        [Parameter(
+            Mandatory = $true,
+            HelpMessage = 'A webapp name is required.')]
+        [ValidateNotNullOrEmpty()]
+        [string] $WebappName,
+
+        [PARAMETER(
+            Mandatory = $true,            
+            HelpMessage = 'The FQDN of the custom hostname you want to bind.')]
+        [ValidateNotNullOrEmpty()]
+        [string] $customWebappHostname,
+
+        [Parameter(
+            Mandatory = $true,
+            HelpMessage = 'A name for an existing Keyvault is required.')]
+        [ValidateNotNullOrEmpty()]
+        [string] $existingKeyvaultName,
+        
+        [PARAMETER(
+            Mandatory = $true,            
+            HelpMessage = 'A name of the pfx certificate stored in the pre-existing keyvault')]
+        [ValidateNotNullOrEmpty()]
+        [string] $existingKeyVaultCertName
+    )
+    #getting webapp resources
+    $webapp = Get-AzureRmResource -Name $webappName
+    #obtaining resource group resources through the use of resource group name tied to webapp
+    $rg = Get-AzureRmResource -ResourceGroupName $webapp.ResourceGroupName 
+
+    #get cert from existing keyvault using provided parameters
+    $cert = Get-AzureKeyVaultSecret -VaultName $existingKeyvaultName -Name $existingKeyVaultCertName
+    $certFull = Get-AzureKeyVaultCertificate -VaultName $existingKeyvaultName -Name $existingKeyVaultCertName
+    if ($cert -eq $null) {
+        Throw "Unable to get the certificate: '$($existingKeyVaultCertName)' from the keyvault: '$($existingKeyvaultName)'. Please check that you have provided the correct vault and certificate name and try again."
+    }
+    #get cert password from existing keyvault using provided parameters
+    $password = Get-AzureKeyVaultSecret -VaultName $existingKeyVaultName -Name "$($existingKeyVaultCertName)-password"
+    if (-not $password) {
+        Throw "Unable to get the secret: '$($existingKeyVaultCertName)-password' from the keyvault: '$($existingKeyvaultName)'. Please check that you have provided the correct vault and password name and try again. Note: a secret stored in a keyvault that contains the password for a PFX certificate must be named in the following pattern '<certificatename>-password'."
+    }
+    if ($rg) {
+        #iterating over the resources and pulling those matching the appropriate resource type
+        $kv = $rg | Where-Object { $_.ResourceType -Match 'Microsoft.KeyVault/vaults' }
+        #iterating through the keyvaults and their access policies, looking for the keyvault that contains an access policy for the webapp.
+        $vaults = $kv | ForEach-Object {Get-AzureRmKeyVault -Name $_.Name}
+        $vaults | ForEach-Object {$_.accessPolicies } | ForEach-Object {
+            $a = $_
+            if($_.ObjectId -eq $webapp.Identity.PrincipalId){
+                Write-Host "Found the keyvault $($a.DisplayName)." -Verbose
+                $newKeyVaultName = $a.DisplayName.split(" ")[0]
+            } 
+            
+        }
+
+        #import the cert into a collection in memory
+        $certBytes = [System.Convert]::FromBase64String($cert.SecretValueText)
+        $certCollection = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
+        $certCollection.Import($certBytes, $null, [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]::Exportable)
+
+        #export the cert collection to the agent working directory
+        $protectedCertificateBytes = $certCollection.Export([System.Security.Cryptography.X509Certificates.X509ContentType]::Pkcs12, $password.SecretText)
+        $certPath = "$(System.DefaultWorkingDirectory)/SslCert.pfx"
+        [System.IO.File]::WriteAllBytes($certPath, $protectedCertificateBytes)
+
+
+        #move the cert to a new keyvault as a certcollection
+        Import-AzureKeyVaultCertificate -VaultName $newKeyVaultName -Name $existingKeyVaultCertName -FilePath $certPath -password $password.SecretValue
+        #add the ssl binding to the webapp using the cert
+        New-AzureRmWebAppSSLBinding -ResourceGroupName $webApp.ResourceGroupName -WebAppName $webappName -Thumbprint $certFull.Thumbprint -Name $customWebappHostname -SslState "SniEnabled"
+       
+    }
+    else {
+        Throw "Unable to obtain the resource group for the web application $($webappName). Please check the name any try again."
+    }
+}
